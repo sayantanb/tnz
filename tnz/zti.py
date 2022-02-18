@@ -14,6 +14,10 @@ Command usage:
       --noztirc        Do not SOURCE .ztirc in home directory
       --rcfile rcfile  Filename to run using SOURCE
 
+Create a command plugin by creating a "zti.commands" entry
+point through setup.py that takes a single argument of a
+command line string.
+
 Environment variables used:
     COLORTERM (see _termlib.py)
     ESCDELAY
@@ -43,6 +47,8 @@ import tempfile
 import threading
 import time
 import traceback
+
+from importlib.metadata import entry_points
 
 from . import _sigx as sigx
 from ._termlib import Term as curses
@@ -149,6 +155,37 @@ class Zti(cmd.Cmd):
 
         if self._zti is None:
             Zti._zti = self
+
+        plugins = []
+        zti_plugins = entry_points().get("zti.commands", [])
+        for entry in zti_plugins:
+            name = entry.name
+            plugins.append(name)
+
+            def do_plugin(arg, entry=entry, **kwargs):
+                plugin = entry.load()
+                try:
+                    with ati.ati.new_program(share_sessions=True):
+                        plugin(arg, **kwargs)
+
+                except Exception:
+                    ati.say(f"{name} failed")
+                    traceback.print_exc()
+
+                sessions = ati.ati.sessions.split()
+                if sessions:
+                    if ati.ati.session not in sessions:
+                        ati.ati.session = sessions[0]
+
+            def help_plugin(entry=entry):
+                plugin = entry.load()
+                self.__shell_mode()
+                plugin("--help")
+
+            setattr(self, f"do_{name}", do_plugin)
+            setattr(self, f"help_{name}", help_plugin)
+
+        self.plugins = " ".join(plugins)
 
     # Methods
 
@@ -3731,6 +3768,11 @@ Enter the GOTO hostname command to get started and
 use the Esc key to get back to this command prompt.
 Use the HELP and HELP KEYS commands for more information.
 """
+    if zti.plugins:
+        intro = f"{intro}Installed plugins: {zti.plugins}\n"
+    else:
+        intro = f"{intro}No plugins installed.\n"
+
     while True:
         text = intro
         intro = ""
