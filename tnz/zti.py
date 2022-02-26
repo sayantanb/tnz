@@ -130,7 +130,9 @@ class Zti(cmd.Cmd):
 
         self.ddmrecv = False  # allow host-initiated ind$file get
         self.ddmsend = False  # allow host-initiated ind$file put
-        self.__in_goto = False
+        self.__plugin_kwargs = {}
+        self.__plugin_goto = ""
+        self.__tb_count = 0
         self.__in_wait = False
         self.__in_script = False
         self.__wait_rc = None
@@ -164,13 +166,34 @@ class Zti(cmd.Cmd):
 
             def do_plugin(arg, entry=entry, **kwargs):
                 plugin = entry.load()
+                self.__bg_wait_end()
+                tb_count = self.__tb_count
+                plugin_goto = self.__plugin_goto
+                self.__plugin_goto = ""
+                kwargs.update(**self.__plugin_kwargs)
+                self.__plugin_kwargs.clear()
                 try:
+                    try:
+                        self.__tb_count = len(traceback.extract_stack())
+                    except Exception:
+                        pass
+
                     with ati.ati.new_program(share_sessions=True):
                         plugin(arg, **kwargs)
 
+                except _ZtiAbort:
+                    pass
+
                 except Exception:
                     ati.say(f"{name} failed")
-                    traceback.print_exc()
+                    self.print_stack(exc=True)
+
+                else:
+                    if plugin_goto:
+                        self.cmdqueue.append(f"GOTO {plugin_goto}\n")
+
+                finally:
+                    self.__tb_count = tb_count
 
                 sessions = ati.ati.sessions.split()
                 if sessions:
@@ -289,8 +312,7 @@ class Zti(cmd.Cmd):
             print("Not in a program. Use EXIT to exit.")
             return
 
-        # FIXME - only abort program -> leave in prompt
-        raise SystemExit(127)
+        raise _ZtiAbort(127)
 
     def do_autosize(self, arg):
         # ready for testing?
@@ -684,7 +706,6 @@ class Zti(cmd.Cmd):
             return
 
         try:
-            self.__in_goto = True
             self.ddmrecv = True  # allow host-initiated ind$file get
             self.ddmsend = True  # allow host-initiated ind$file put
             self.__prog_mode()
@@ -692,29 +713,38 @@ class Zti(cmd.Cmd):
                 r2d2rv = self.__r2d2(self.stdscr, _WAIT_GOTO, -1)
 
             except tnz.TnzTerminalError:
-                self.__shell_mode()
-                traceback.print_exc()
+                self.print_stack(exc=True)
                 print("Maybe set SESSION_PS_SIZE?")
                 r2d2rv = None
 
             except tnz.TnzError:
-                self.__shell_mode()
-                traceback.print_exc()
+                self.print_stack(exc=True)
                 r2d2rv = None
 
         finally:
-            self.__in_goto = False
             self.ddmrecv = False  # ind$file get unexpected
             self.ddmsend = False  # ind$file put unexpected
 
         if r2d2rv == 10:  # ddmdata
-            # process function outside of cmdloop
-            # the cmdqueue will bring us back into cmdloop
-            downi = len(self.downloads) - 1
-            self.cmdqueue += [ati.ati.get_tnz()]
-            self.cmdqueue += ["discard "+repr(downi)+"\n"]
-            self.cmdqueue += ["goto "+ati.ati.session+"\n"]
-            return 10  # have ddmdata
+            self.shell_mode()
+            tns = ati.ati.get_tnz()
+            ddmdata = tns.ddmdata
+            ddmdict = dict(tns.ddmdict)
+            tns.ddmdata = None
+            tns.ddmdict.clear()
+            plugin_name = ddmdict.get("plugin")
+            if plugin_name:
+                del ddmdict["plugin"]
+                self.__plugin_kwargs = ddmdict
+                self.cmdqueue.append(f"{plugin_name}\n")
+                downi = len(self.downloads) - 1
+                self.cmdqueue.append(f"discard {downi}\n")
+                self.__plugin_goto = ati.ati.session
+
+            else:
+                print(ddmdata)
+
+            return
 
         if r2d2rv == 11:  # downloadaction
             actiontaken = False
@@ -803,7 +833,7 @@ class Zti(cmd.Cmd):
                 shutil.copyfile(name, dest)
 
             except BaseException:
-                traceback.print_exc()
+                self.print_stack(exc=True)
 
         self.downloads.pop(0)
         download.remove()
@@ -1203,12 +1233,7 @@ class Zti(cmd.Cmd):
     def onerror(self):
         """Ati error handler
         """
-        self.shell_mode()
-        try:
-            traceback.print_stack()
-        except BaseException:
-            print("<stack trace unavailable>")
-
+        self.print_stack()
         intro = """
 ERROR RECOVERY FOR WAIT TIMEOUT
 
@@ -1222,6 +1247,8 @@ ONERROR=1. Consider the above commands to recover. The above stack
 trace provides context for where the error occurred. Use the HELP and
 HELP KEYS commands for more information.
 """
+        in_script = self.__in_script
+        in_wait = self.__in_wait
         try:
             self.__in_script = True
             self.__in_wait = True
@@ -1229,8 +1256,8 @@ HELP KEYS commands for more information.
             self.cmdloop(intro)
 
         finally:
-            self.__in_script = False
-            self.__in_wait = False
+            self.__in_script = in_script
+            self.__in_wait = in_wait
 
         return self.__wait_rc
 
@@ -1238,13 +1265,16 @@ HELP KEYS commands for more information.
         """Pause script
         """
         self.shell_mode()
+        in_script = self.__in_script
+        in_wait = self.__in_wait
         try:
             self.__in_script = True
             self.__in_wait = False
             self.cmdloop("")
 
         finally:
-            self.__in_script = False
+            self.__in_script = in_script
+            self.__in_wait = in_wait
 
     def postcmd(self, stop, line):
         """Override cmd.Cmd.postcmd
@@ -1315,6 +1345,22 @@ HELP KEYS commands for more information.
         """
         self.__update_prompt()  # according to SESSION
         self.__bg_wait_start()
+
+    def print_stack(self, exc=False):
+        self.__shell_mode()
+        try:
+            current_tb_count = len(traceback.extract_stack())
+            limit = current_tb_count - self.__tb_count
+            if limit <= 1:
+                limit = None
+
+            if exc:
+                traceback.print_exc(limit=limit)
+            else:
+                traceback.print_stack(limit=limit)
+
+        except BaseException:
+            print("<stack trace unavailable>")
 
     def shell_mode(self):
         self.__shell_mode()
@@ -1389,18 +1435,15 @@ HELP KEYS commands for more information.
             return r2d2rv  # return timeout, satisfied, seslost
 
         self.shell_mode()
-
+        in_script = self.__in_script
+        in_wait = self.__in_wait
         try:
             self.__in_script = True
             if not keylock:
                 self.__in_wait = True
                 self.__wait_rc = None
 
-            try:
-                traceback.print_stack()
-            except BaseException:
-                pass
-
+            self.print_stack()
             intro = """
 Program execution paused
 
@@ -1420,8 +1463,8 @@ HELP and HELP KEYS commands for more information.
             self.cmdloop(intro)
 
         finally:
-            self.__in_wait = False
-            self.__in_script = False
+            self.__in_wait = in_wait
+            self.__in_script = in_script
 
         _logger.debug("Zti.wait returning %r", self.__wait_rc)
         return self.__wait_rc
@@ -3685,7 +3728,7 @@ HELP and HELP KEYS commands for more information.
     _stdscr = None
 
 
-class _ZtiAbort(Exception):
+class _ZtiAbort(BaseException):
     pass
 
 
@@ -3773,20 +3816,7 @@ Use the HELP and HELP KEYS commands for more information.
     else:
         intro = f"{intro}No plugins installed.\n"
 
-    while True:
-        text = intro
-        intro = ""
-        zti.cmdloop(text)
-
-        if not zti.cmdqueue:
-            break
-
-        tns = zti.cmdqueue.pop(0)
-        ddmdata = tns.ddmdata
-        tns.ddmdata = None
-        zti.cmdqueue.pop(0)
-        zti.shell_mode()
-        print(ddmdata)
+    zti.cmdloop(intro)
 
 
 # Private data
